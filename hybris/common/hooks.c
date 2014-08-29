@@ -18,7 +18,7 @@
  *
  */
 
-#include <hybris/internal/binding.h>
+#include <hybris/common/binding.h>
 
 #include "hooks_shm.h"
 
@@ -37,9 +37,11 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/types.h>
+#include <stdarg.h>
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <fcntl.h>
 
 #include <unistd.h>
 #include <locale.h>
@@ -493,8 +495,7 @@ static int my_pthread_mutex_lock_timeout_np(pthread_mutex_t *__mutex, unsigned _
         *((int *)__mutex) = (int) realmutex;
     }
 
-    /* TODO: Android uses CLOCK_MONOTONIC here but I am not sure which one to use */
-    clock_gettime(CLOCK_REALTIME, &tv);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &tv);
     tv.tv_sec += __msecs/1000;
     tv.tv_nsec += (__msecs % 1000) * 1000000;
     if (tv.tv_nsec >= 1000000000) {
@@ -710,9 +711,8 @@ static int my_pthread_cond_timedwait_relative_np(pthread_cond_t *cond,
         *((unsigned int *) mutex) = (unsigned int) realmutex;
     }
 
-    /* TODO: Android uses CLOCK_MONOTONIC here but I am not sure which one to use */
     struct timespec tv;
-    clock_gettime(CLOCK_REALTIME, &tv);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &tv);
     tv.tv_sec += reltime->tv_sec;
     tv.tv_nsec += reltime->tv_nsec;
     if (tv.tv_nsec >= 1000000000) {
@@ -1173,6 +1173,79 @@ static int my_setlinebuf(FILE *fp)
     return 0;
 }
 
+/* "struct dirent" from bionic/libc/include/dirent.h */
+struct bionic_dirent {
+    uint64_t         d_ino;
+    int64_t          d_off;
+    unsigned short   d_reclen;
+    unsigned char    d_type;
+    char             d_name[256];
+};
+
+static struct bionic_dirent *my_readdir(DIR *dirp)
+{
+    /**
+     * readdir(3) manpage says:
+     *  The data returned by readdir() may be overwritten by subsequent calls
+     *  to readdir() for the same directory stream.
+     *
+     * XXX: At the moment, for us, the data will be overwritten even by
+     * subsequent calls to /different/ directory streams. Eventually fix that
+     * (e.g. by storing per-DIR * bionic_dirent structs, and removing them on
+     * closedir, requires hooking of all funcs returning/taking DIR *) and
+     * handling the additional data attachment there)
+     **/
+
+    static struct bionic_dirent result;
+
+    struct dirent *real_result = readdir(dirp);
+    if (!real_result) {
+        return NULL;
+    }
+
+    result.d_ino = real_result->d_ino;
+    result.d_off = real_result->d_off;
+    result.d_reclen = real_result->d_reclen;
+    result.d_type = real_result->d_type;
+    memcpy(result.d_name, real_result->d_name, sizeof(result.d_name));
+
+    // Make sure the string is zero-terminated, even if cut off (which
+    // shouldn't happen, as both bionic and glibc have d_name defined
+    // as fixed array of 256 chars)
+    result.d_name[sizeof(result.d_name)-1] = '\0';
+    return &result;
+}
+
+static int my_readdir_r(DIR *dir, struct bionic_dirent *entry,
+        struct bionic_dirent **result)
+{
+    struct dirent entry_r;
+    struct dirent *result_r;
+
+    int res = readdir_r(dir, &entry_r, &result_r);
+
+    if (res == 0) {
+        if (result_r != NULL) {
+            *result = entry;
+
+            entry->d_ino = entry_r.d_ino;
+            entry->d_off = entry_r.d_off;
+            entry->d_reclen = entry_r.d_reclen;
+            entry->d_type = entry_r.d_type;
+            memcpy(entry->d_name, entry_r.d_name, sizeof(entry->d_name));
+
+            // Make sure the string is zero-terminated, even if cut off (which
+            // shouldn't happen, as both bionic and glibc have d_name defined
+            // as fixed array of 256 chars)
+            entry->d_name[sizeof(entry->d_name) - 1] = '\0';
+        } else {
+            *result = NULL;
+        }
+    }
+
+    return res;
+}
+
 extern long my_sysconf(int name);
 
 FP_ATTRIB static double my_strtod(const char *nptr, char **endptr)
@@ -1183,6 +1256,45 @@ FP_ATTRIB static double my_strtod(const char *nptr, char **endptr)
 		locale_inited = 1;
 	}
 	return strtod_l(nptr, endptr, hybris_locale);
+}
+
+struct open_redirect {
+	const char *from;
+	const char *to;
+};
+
+struct open_redirect open_redirects[] = {
+	{ "/dev/log/main", "/dev/log_main" },
+	{ "/dev/log/radio", "/dev/log_radio" },
+	{ "/dev/log/system", "/dev/log_system" },
+	{ "/dev/log/events", "/dev/log_events" },
+	{ NULL, NULL }
+};
+
+int my_open(const char *pathname, int flags, ...)
+{
+	va_list ap;
+	mode_t mode = 0;
+	const char *target_path = pathname;
+
+	if (pathname != NULL) {
+		struct open_redirect *entry = &open_redirects[0];
+		while (entry->from != NULL) {
+			if (strcmp(pathname, entry->from) == 0) {
+				target_path = entry->to;
+				break;
+			}
+			entry++;
+		}
+	}
+
+	if (flags & O_CREAT) {
+		va_start(ap, flags);
+		mode = va_arg(ap, mode_t);
+		va_end(ap);
+	}
+
+	return open(target_path, flags, mode);
 }
 
 static char* use_from_bionic[] = {
@@ -1326,6 +1438,19 @@ static struct _hook hooks[] = {
     {"dlsym", android_dlsym},
     {"dladdr", android_dladdr},
     {"dlclose", android_dlclose},
+    /* dirent.h */
+    {"opendir", opendir},
+    {"fdopendir", fdopendir},
+    {"closedir", closedir},
+    {"readdir", my_readdir},
+    {"readdir_r", my_readdir_r},
+    {"rewinddir", rewinddir},
+    {"seekdir", seekdir},
+    {"telldir", telldir},
+    {"dirfd", dirfd},
+    /* fcntl.h */
+    {"open", my_open},
+    // TODO: scandir, scandirat, alphasort, versionsort
     {NULL, NULL},
 };
 
