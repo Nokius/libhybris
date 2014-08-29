@@ -162,10 +162,16 @@ extern "C" void waylandws_finishSwap(EGLDisplay dpy, EGLNativeWindowType win)
 	WaylandNativeWindow *window = static_cast<WaylandNativeWindow *>((struct ANativeWindow *)win);
 	if (_eglCreateSyncKHR) {
 		EGLSyncKHR sync = (*_eglCreateSyncKHR)(dpy, EGL_SYNC_FENCE_KHR, NULL);
-		(*_eglClientWaitSyncKHR)(dpy, sync, 0, EGL_FOREVER_KHR);
+		(*_eglClientWaitSyncKHR)(dpy, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER_KHR);
 		(*_eglDestroySyncKHR)(dpy, sync);
 	}
 	window->finishSwap();
+}
+
+extern "C" void waylandws_setSwapInterval(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval)
+{
+	WaylandNativeWindow *window = static_cast<WaylandNativeWindow *>((struct ANativeWindow *)win);
+	window->setSwapInterval(interval);
 }
 
 struct ws_module ws_module_info = {
@@ -178,6 +184,7 @@ struct ws_module ws_module_info = {
 	waylandws_eglQueryString,
 	waylandws_prepareSwap,
 	waylandws_finishSwap,
+	waylandws_setSwapInterval,
 };
 
 
